@@ -17,7 +17,65 @@ CREATE INDEX IF NOT EXISTS characters_realm ON characters(realm);
 -- global unique on characters.name to a (realm, name) composite. This is a
 -- constraint relaxation, so existing globally-unique rows always satisfy it.
 ALTER TABLE characters DROP CONSTRAINT IF EXISTS characters_name_key;
-CREATE UNIQUE INDEX IF NOT EXISTS characters_realm_name ON characters(realm, name);
+-- Uniqueness is enforced case-INSENSITIVELY — on (realm, lower(name)) — to
+-- match how every name lookup in the codebase folds case (findCharacterByName,
+-- findCharacterReportTargetByName, searchCharacters). A case-sensitive index
+-- would let 'Bob' and 'bob' coexist in a realm, breaking the "names are unique
+-- per realm" invariant and making moderation/social lookups resolve to the
+-- wrong account (issue #137). Inserts that collide raise 23505, which the
+-- create path already maps to a 409 "that name is taken".
+--
+-- This whole block is a one-time migration off the old case-sensitive
+-- (realm, name) index, gated so an already-migrated DB skips it entirely.
+-- ensureSchema() runs SOCIAL_SCHEMA on every boot (once per realm process,
+-- under an advisory lock), so an UNCONDITIONAL drop+recreate would rebuild the
+-- unique index — a full table scan that blocks writes — on every startup. The
+-- guard checks for the folded index (its def contains 'lower(name)'); when it
+-- already exists this is a cheap catalog lookup and nothing is rebuilt.
+--
+-- On first migration it: (1) disambiguates any pre-existing case-collisions,
+-- which CREATE UNIQUE INDEX on lower(name) would otherwise error on —
+-- deterministically and idempotently keeping the earliest (lowest-id) row's
+-- name and, for each later colliding row, appending a '~<id>' suffix (id is
+-- unique, so the folded name becomes unique) and flagging force_rename so the
+-- player must pick a new name before next login (the same mechanism moderation
+-- uses for name resets); then (2) drops the old case-sensitive index and builds
+-- the folded one. Stored display case is preserved throughout.
+DO $$
+DECLARE
+  dup RECORD;
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE indexname = 'characters_realm_name' AND indexdef LIKE '%lower(name)%'
+  ) THEN
+    RETURN; -- already migrated; do not rebuild the index on every boot
+  END IF;
+
+  FOR dup IN
+    SELECT id, name
+    FROM (
+      SELECT id, name,
+             row_number() OVER (PARTITION BY realm, lower(name) ORDER BY id) AS rn
+      FROM characters
+    ) ranked
+    WHERE rn > 1
+  LOOP
+    UPDATE characters
+    SET name = left(dup.name, 16) || '~' || dup.id,
+        force_rename = TRUE
+    WHERE id = dup.id;
+  END LOOP;
+
+  DROP INDEX IF EXISTS characters_realm_name;
+  CREATE UNIQUE INDEX characters_realm_name ON characters(realm, lower(name));
+END $$;
+-- Retained, NOT subsumed: this text_pattern_ops index is what serves the
+-- typeahead's anchored "lower(name) LIKE 'prefix%'" query in searchCharacters.
+-- The unique index above uses the default text_ops operator class, which serves
+-- equality (lower(name) = ...) but cannot drive a LIKE prefix scan outside the C
+-- locale — verified on Postgres 16, en_US.UTF-8: without this index that LIKE
+-- falls back to a Seq Scan.
 CREATE INDEX IF NOT EXISTS characters_realm_lower_name_prefix
   ON characters (realm, lower(name) text_pattern_ops);
 
@@ -64,12 +122,14 @@ export class PgSocialDb implements SocialDb {
 
   async findCharacterByName(name: string): Promise<CharInfo | null> {
     // scoped to this realm: you can only friend/ignore/invite characters that
-    // live on the same world as you. exact case wins; otherwise an unambiguous
-    // case-insensitive match
-    const exact = await this.pool.query(`SELECT ${CHAR_COLS} FROM characters WHERE name = $1 AND realm = $2`, [name, REALM]);
-    if (exact.rows[0]) return exact.rows[0];
-    const ci = await this.pool.query(`SELECT ${CHAR_COLS} FROM characters WHERE lower(name) = lower($1) AND realm = $2 LIMIT 2`, [name, REALM]);
-    return ci.rows.length === 1 ? ci.rows[0] : null;
+    // live on the same world as you. Names are now unique per realm under
+    // case-folding (the (realm, lower(name)) unique index), so a single
+    // case-insensitive lookup is unambiguous — there can be at most one match.
+    // This also keeps the query on the folded index; a raw `name = $1` branch
+    // would have no supporting index after the case-sensitive one was dropped
+    // and would scan the whole realm.
+    const res = await this.pool.query(`SELECT ${CHAR_COLS} FROM characters WHERE lower(name) = lower($1) AND realm = $2 LIMIT 1`, [name, REALM]);
+    return res.rows[0] ?? null;
   }
 
   async getCharacter(id: number): Promise<CharInfo | null> {
